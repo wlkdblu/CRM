@@ -2,6 +2,7 @@ generator client { provider = "prisma-client-js" }
 datasource db { provider = "postgresql" url = env("DATABASE_URL") }
 
 enum Role { ADMIN TRAFFIC HANDLER }
+enum RegistrationStatus { PENDING APPROVED REJECTED }
 enum TrafficType { fb tiktok google native push seo other }
 enum LeadStatus { new in_progress closed rejected }
 enum AuditAction { LEAD_CREATED LEAD_STATUS_CHANGED SHIFT_STARTED SHIFT_ENDED TRAFFIC_ID_ASSIGNED HANDLER_TARGET_SELECTED }
@@ -11,7 +12,8 @@ model User {
   telegramId String   @unique
   username    String?
   name        String
-  role        Role
+  role        Role?
+  registrationStatus RegistrationStatus @default(PENDING)
   trafficId   String?  @unique
   isActive    Boolean  @default(true)
   shift       HandlerShift?

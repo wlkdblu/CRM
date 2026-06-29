@@ -1,4 +1,5 @@
 CREATE TYPE "Role" AS ENUM ('ADMIN', 'TRAFFIC', 'HANDLER');
+CREATE TYPE "RegistrationStatus" AS ENUM ('PENDING', 'APPROVED', 'REJECTED');
 CREATE TYPE "TrafficType" AS ENUM ('fb', 'tiktok', 'google', 'native', 'push', 'seo', 'other');
 CREATE TYPE "LeadStatus" AS ENUM ('new', 'in_progress', 'closed', 'rejected');
 CREATE TYPE "AuditAction" AS ENUM ('LEAD_CREATED', 'LEAD_STATUS_CHANGED', 'SHIFT_STARTED', 'SHIFT_ENDED', 'TRAFFIC_ID_ASSIGNED', 'HANDLER_TARGET_SELECTED');
@@ -8,7 +9,8 @@ CREATE TABLE "User" (
   "telegramId" TEXT NOT NULL,
   "username" TEXT,
   "name" TEXT NOT NULL,
-  "role" "Role" NOT NULL,
+  "role" "Role",
+  "registrationStatus" "RegistrationStatus" NOT NULL DEFAULT 'PENDING',
   "trafficId" TEXT,
   "isActive" BOOLEAN NOT NULL DEFAULT true,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,

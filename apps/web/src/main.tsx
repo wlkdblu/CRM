@@ -2,14 +2,41 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
+declare global {
+  interface Window { Telegram?: { WebApp?: { ready: () => void; initDataUnsafe?: { user?: TelegramUser } } } }
+}
+
 type Role = 'ADMIN' | 'TRAFFIC' | 'HANDLER';
-type User = { id: string; name: string; username?: string; telegramId?: string; role: Role; trafficId?: string };
+type TelegramUser = { id: number; username?: string; first_name?: string; last_name?: string };
+type User = { id: string; name: string; username?: string; telegramId?: string; role?: Role; trafficId?: string; registrationStatus?: string };
 type Lead = { id: string; name: string; contact: string; trafficId: string; trafficType: string; status: string; comment?: string };
 type Handler = User & { shift?: { isOnShift: boolean } };
 
 const api = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000';
 const statuses = ['new', 'in_progress', 'closed', 'rejected'];
 const trafficTypes = ['fb', 'tiktok', 'google', 'native', 'push', 'seo', 'other'];
+const roles: Role[] = ['HANDLER', 'TRAFFIC', 'ADMIN'];
+
+function getTelegramUser(): TelegramUser | null {
+  return window.Telegram?.WebApp?.initDataUnsafe?.user || null;
+}
+
+function telegramPayload() {
+  const tgUser = getTelegramUser();
+  if (tgUser) {
+    return {
+      telegramId: String(tgUser.id),
+      username: tgUser.username,
+      name: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || tgUser.username || String(tgUser.id),
+    };
+  }
+
+  return {
+    telegramId: localStorage.getItem('devTelegramId') || '1001',
+    username: localStorage.getItem('devUsername') || 'local_user',
+    name: localStorage.getItem('devName') || 'Local User',
+  };
+}
 
 function tokenFromUrl() {
   return new URLSearchParams(location.search).get('token') || localStorage.getItem('token') || '';
@@ -18,13 +45,22 @@ function tokenFromUrl() {
 function App() {
   const [token, setToken] = useState(tokenFromUrl());
   const [user, setUser] = useState<User | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [handlers, setHandlers] = useState<Handler[]>([]);
   const [selectedTarget, setSelectedTarget] = useState<any>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [stats, setStats] = useState<any>(null);
+  const [pendingUsers, setPendingUsers] = useState<User[]>([]);
+  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
   const headers = useMemo(() => ({ 'content-type': 'application/json', authorization: `Bearer ${token}` }), [token]);
+
+  async function anonymousRequest(path: string, body: unknown) {
+    const response = await fetch(`${api}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+  }
 
   async function request(path: string, options: RequestInit = {}) {
     const response = await fetch(`${api}${path}`, { ...options, headers: { ...headers, ...(options.headers || {}) } });
@@ -32,9 +68,31 @@ function App() {
     return response.json();
   }
 
+  async function checkAuth() {
+    setError('');
+    const auth = await anonymousRequest('/auth/telegram', telegramPayload());
+    if (!auth.registered) {
+      setToken('');
+      localStorage.removeItem('token');
+      setUser(auth.user);
+      setAuthChecked(true);
+      return;
+    }
+
+    localStorage.setItem('token', auth.token);
+    setToken(auth.token);
+    setUser(auth.user);
+    setAuthChecked(true);
+  }
+
+  async function submitRegistration() {
+    const response = await anonymousRequest('/auth/register-request', telegramPayload());
+    setMessage(response.message);
+    setUser(response.user);
+  }
+
   async function refresh() {
     if (!token) return;
-    localStorage.setItem('token', token);
     const me = await request('/me');
     setUser(me);
 
@@ -47,21 +105,76 @@ function App() {
       setLeads(await request('/handler/leads'));
       setStats(await request('/handler/stats'));
     }
+    if (me.role === 'ADMIN') {
+      setPendingUsers(await request('/admin/users?status=PENDING'));
+    }
   }
+
+  useEffect(() => {
+    window.Telegram?.WebApp?.ready();
+    checkAuth().catch((e) => setError(e.message));
+  }, []);
 
   useEffect(() => {
     refresh().catch((e) => setError(e.message));
   }, [token]);
 
+  if (!authChecked) return <main><h1>Arbitrage CRM</h1><p>Проверяем регистрацию...</p></main>;
+
+  if (!token) {
+    return (
+      <main>
+        <h1>Arbitrage CRM</h1>
+        {error && <p className="error">{error}</p>}
+        {message ? <p className="success">{message}</p> : <button onClick={submitRegistration}>Зарегистрироваться</button>}
+        <p>После назначения роли администратором снова откройте Mini App из бота.</p>
+      </main>
+    );
+  }
+
   return (
     <main>
       <h1>Arbitrage CRM</h1>
-      {!token && <input placeholder="JWT token" onChange={(e) => setToken(e.target.value)} />}
       {error && <p className="error">{error}</p>}
       {user && <p>{user.name} · {user.role}{user.trafficId ? ` · traffic_id ${user.trafficId}` : ''}</p>}
+      {user?.role === 'ADMIN' && <AdminPanel pendingUsers={pendingUsers} request={request} refresh={refresh} />}
       {user?.role !== 'HANDLER' && <TrafficPanel handlers={handlers} selectedTarget={selectedTarget} stats={stats} request={request} refresh={refresh} />}
       {user?.role === 'HANDLER' && <HandlerPanel request={request} refresh={refresh} leads={leads} stats={stats} />}
     </main>
+  );
+}
+
+function AdminPanel({ pendingUsers, request, refresh }: any) {
+  const [forms, setForms] = useState<Record<string, { role: Role; trafficId: string }>>({});
+
+  async function approve(userId: string) {
+    const form = forms[userId] || { role: 'HANDLER', trafficId: '' };
+    await request(`/admin/users/${userId}/approve`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role: form.role, trafficId: form.trafficId || undefined }),
+    });
+    await refresh();
+  }
+
+  return (
+    <section>
+      <h2>Заявки на регистрацию</h2>
+      {pendingUsers.length === 0 && <p>Новых заявок нет.</p>}
+      {pendingUsers.map((pending: User) => {
+        const form = forms[pending.id] || { role: 'HANDLER', trafficId: '' };
+        return (
+          <article key={pending.id}>
+            <b>{pending.name}</b>
+            <p>@{pending.username || '-'} · telegram_id {pending.telegramId}</p>
+            <select value={form.role} onChange={(e) => setForms({ ...forms, [pending.id]: { ...form, role: e.target.value as Role } })}>
+              {roles.map((role) => <option key={role}>{role}</option>)}
+            </select>
+            <input placeholder="traffic_id для TRAFFIC" value={form.trafficId} onChange={(e) => setForms({ ...forms, [pending.id]: { ...form, trafficId: e.target.value } })} />
+            <button onClick={() => approve(pending.id)}>Назначить роль</button>
+          </article>
+        );
+      })}
+    </section>
   );
 }
 

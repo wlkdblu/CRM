@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { AuditAction, LeadStatus, Role, TrafficType } from '@prisma/client';
+import { AuditAction, LeadStatus, RegistrationStatus, Role, TrafficType } from '@prisma/client';
 import { z } from 'zod';
 import { auth, requireRole } from '../middleware/auth.js';
 import { prisma } from '../lib/prisma.js';
@@ -120,6 +120,34 @@ coreRouter.get('/handler/stats', requireRole(Role.HANDLER, Role.ADMIN), async (r
   res.json({ handlerId, total, byTrafficId });
 });
 
+
+coreRouter.get('/admin/users', requireRole(Role.ADMIN), async (req, res) => {
+  const status = req.query.status?.toString() as RegistrationStatus | undefined;
+  const users = await prisma.user.findMany({
+    where: status ? { registrationStatus: status } : {},
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(users);
+});
+
+const approveUserSchema = z.object({
+  role: z.nativeEnum(Role),
+  trafficId: z.string().optional(),
+});
+coreRouter.patch('/admin/users/:id/approve', requireRole(Role.ADMIN), async (req, res) => {
+  const input = approveUserSchema.parse(req.body);
+  const user = await prisma.user.update({
+    where: { id: req.params.id },
+    data: { role: input.role, trafficId: input.trafficId, registrationStatus: RegistrationStatus.APPROVED, isActive: true },
+  });
+  if (input.trafficId) {
+    await prisma.auditLog.create({
+      data: { action: AuditAction.TRAFFIC_ID_ASSIGNED, actorId: req.user!.id, metadata: { userId: user.id, trafficId: input.trafficId } },
+    });
+  }
+  res.json(user);
+});
+
 const userSchema = z.object({
   telegramId: z.string(),
   name: z.string(),
@@ -129,7 +157,11 @@ const userSchema = z.object({
 });
 coreRouter.post('/admin/users', requireRole(Role.ADMIN), async (req, res) => {
   const input = userSchema.parse(req.body);
-  const user = await prisma.user.upsert({ where: { telegramId: input.telegramId }, update: input, create: input });
+  const user = await prisma.user.upsert({
+    where: { telegramId: input.telegramId },
+    update: { ...input, registrationStatus: RegistrationStatus.APPROVED },
+    create: { ...input, registrationStatus: RegistrationStatus.APPROVED },
+  });
   if (input.trafficId) {
     await prisma.auditLog.create({
       data: { action: AuditAction.TRAFFIC_ID_ASSIGNED, actorId: req.user!.id, metadata: { userId: user.id, trafficId: input.trafficId } },

@@ -16,7 +16,7 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret') as JwtPayload;
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-    if (!user || !user.isActive) return res.status(401).json({ error: 'Unauthorized' });
+    if (!user || !user.isActive || user.registrationStatus !== 'APPROVED' || !user.role) return res.status(401).json({ error: 'Unauthorized' });
     req.user = user;
     next();
   } catch {
@@ -26,7 +26,7 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
 
 export function requireRole(...roles: Role[]) {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
+    if (!req.user || !req.user.role || !roles.includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
     next();
   };
 }
