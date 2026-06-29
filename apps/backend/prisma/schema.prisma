@@ -1,0 +1,76 @@
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+
+enum Role { ADMIN TRAFFIC HANDLER }
+enum TrafficType { fb tiktok google native push seo other }
+enum LeadStatus { new in_progress closed rejected }
+enum AuditAction { LEAD_CREATED LEAD_STATUS_CHANGED SHIFT_STARTED SHIFT_ENDED TRAFFIC_ID_ASSIGNED HANDLER_TARGET_SELECTED }
+
+model User {
+  id          String   @id @default(uuid())
+  telegramId String   @unique
+  username    String?
+  name        String
+  role        Role
+  trafficId   String?  @unique
+  isActive    Boolean  @default(true)
+  shift       HandlerShift?
+  handledLeads Lead[] @relation("HandlerLeads")
+  auditLogs   AuditLog[]
+  trafficTargets TrafficTarget[] @relation("TrafficTargets")
+  handlerTargets TrafficTarget[] @relation("HandlerTargets")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model HandlerShift {
+  id        String   @id @default(uuid())
+  handlerId String   @unique
+  isOnShift Boolean  @default(false)
+  startedAt DateTime?
+  endedAt   DateTime?
+  handler   User     @relation(fields: [handlerId], references: [id], onDelete: Cascade)
+  updatedAt DateTime @updatedAt
+}
+
+model Lead {
+  id          String      @id @default(uuid())
+  name        String
+  contact     String
+  trafficId   String
+  trafficType TrafficType
+  comment     String?
+  status      LeadStatus  @default(new)
+  handlerId   String
+  handler     User        @relation("HandlerLeads", fields: [handlerId], references: [id])
+  auditLogs   AuditLog[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([trafficId])
+  @@index([handlerId])
+}
+
+model TrafficTarget {
+  id        String   @id @default(uuid())
+  trafficId String
+  handlerId String
+  traffic   User     @relation("TrafficTargets", fields: [trafficId], references: [id], onDelete: Cascade)
+  handler   User     @relation("HandlerTargets", fields: [handlerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([trafficId])
+  @@index([handlerId])
+}
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  action    AuditAction
+  actorId   String?
+  leadId    String?
+  metadata  Json?
+  actor     User?       @relation(fields: [actorId], references: [id])
+  lead      Lead?       @relation(fields: [leadId], references: [id])
+  createdAt DateTime    @default(now())
+}
