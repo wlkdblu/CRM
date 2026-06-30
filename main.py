@@ -1,15 +1,17 @@
 import json
 import sqlite3
+import threading
 import time
 import traceback
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from config import ADMIN_IDS, BOT_TOKEN, DB_PATH
+from config import ADMIN_IDS, BOT_TOKEN, DB_PATH, OFFERS, WEB_APP_URL, WEB_PORT
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-LEAD_STATUSES = ["new", "in_progress", "closed", "rejected"]
+LEAD_STATUSES = ["в обработке", "ждет продукт", "выполнение цд", "отказал", "заявка на выплату", "выплачено"]
 TRAFFIC_TYPES = ["fb", "tiktok", "google", "native", "push", "seo", "other"]
 user_states: dict[int, dict[str, Any]] = {}
 
@@ -45,11 +47,25 @@ def init_db() -> None:
                 traffic_id TEXT NOT NULL,
                 traffic_type TEXT NOT NULL,
                 comment TEXT,
-                status TEXT NOT NULL DEFAULT 'new',
+                status TEXT NOT NULL DEFAULT 'в обработке',
+                offer_key TEXT,
+                offer_title TEXT,
+                offer_payout REAL NOT NULL DEFAULT 0,
+                lead_payout REAL NOT NULL DEFAULT 0,
+                payout_requested INTEGER NOT NULL DEFAULT 0,
                 handler_user_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(handler_user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS traffic_budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                traffic_user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                comment TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(traffic_user_id) REFERENCES users(id)
             );
 
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -61,6 +77,22 @@ def init_db() -> None:
             );
             """
         )
+        ensure_schema(con)
+
+
+def ensure_schema(con: sqlite3.Connection) -> None:
+    lead_columns = {row["name"] for row in con.execute("PRAGMA table_info(leads)").fetchall()}
+    migrations = {
+        "offer_key": "ALTER TABLE leads ADD COLUMN offer_key TEXT",
+        "offer_title": "ALTER TABLE leads ADD COLUMN offer_title TEXT",
+        "offer_payout": "ALTER TABLE leads ADD COLUMN offer_payout REAL NOT NULL DEFAULT 0",
+        "lead_payout": "ALTER TABLE leads ADD COLUMN lead_payout REAL NOT NULL DEFAULT 0",
+        "payout_requested": "ALTER TABLE leads ADD COLUMN payout_requested INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, sql in migrations.items():
+        if column not in lead_columns:
+            con.execute(sql)
+    con.execute("CREATE TABLE IF NOT EXISTS traffic_budgets (id INTEGER PRIMARY KEY AUTOINCREMENT, traffic_user_id INTEGER NOT NULL, amount REAL NOT NULL, comment TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(traffic_user_id) REFERENCES users(id))")
 
 
 def api(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -83,6 +115,11 @@ def answer_callback(callback_id: str, text: str = "") -> None:
 
 def button(text: str, data: str) -> dict[str, str]:
     return {"text": text, "callback_data": data}
+
+
+def web_button(text: str, telegram_id: int) -> dict[str, Any]:
+    separator = "&" if "?" in WEB_APP_URL else "?"
+    return {"text": text, "web_app": {"url": f"{WEB_APP_URL}{separator}tg={telegram_id}"}}
 
 
 def full_name(from_user: dict[str, Any]) -> str:
@@ -140,12 +177,14 @@ def main_menu(chat_id: int, user: sqlite3.Row) -> None:
     if user["role"] == "admin":
         keyboard = [
             [button("📥 Заявки", "admin:requests"), button("📊 Статистика", "admin:stats")],
+            [web_button("📱 Мини-приложение", user["telegram_id"])],
         ]
         send_message(chat_id, "Админ-панель", keyboard)
     elif user["role"] == "traffic":
         keyboard = [
             [button("👥 Обработчики на смене", "traffic:handlers")],
-            [button("📊 Моя статистика", "traffic:stats")],
+            [button("💰 Внести бюджет", "traffic:add_budget"), button("📊 Моя статистика", "traffic:stats")],
+            [web_button("📱 Мини-приложение", user["telegram_id"])],
         ]
         send_message(chat_id, f"Панель траффера\ntraffic_id: <b>{user['traffic_id'] or 'не назначен'}</b>", keyboard)
     elif user["role"] == "handler":
@@ -153,7 +192,8 @@ def main_menu(chat_id: int, user: sqlite3.Row) -> None:
         keyboard = [
             [button("🟢 Выйти на смену", "handler:shift_on"), button("🔴 Закончить смену", "handler:shift_off")],
             [button("➕ Добавить лида", "handler:add_lead"), button("📋 Мои лиды", "handler:leads")],
-            [button("📊 Моя статистика", "handler:stats")],
+            [button("💸 Заявки на выплату", "handler:payout_requests"), button("📊 Моя статистика", "handler:stats")],
+            [web_button("📱 Мини-приложение", user["telegram_id"])],
         ]
         send_message(chat_id, f"Панель обработчика\nСтатус: <b>{shift_text}</b>", keyboard)
 
@@ -256,6 +296,8 @@ def traffic_stats(chat_id: int, user: sqlite3.Row) -> None:
         return
     with db() as con:
         total = con.execute("SELECT COUNT(*) AS c FROM leads WHERE traffic_id = ?", (user["traffic_id"],)).fetchone()["c"]
+        approved = con.execute("SELECT COUNT(*) AS c FROM leads WHERE traffic_id = ? AND lead_payout > 0", (user["traffic_id"],)).fetchone()["c"]
+        budget = con.execute("SELECT COALESCE(SUM(amount), 0) AS s FROM traffic_budgets WHERE traffic_user_id = ?", (user["id"],)).fetchone()["s"]
         rows = con.execute(
             """
             SELECT users.full_name, COUNT(leads.id) AS count
@@ -267,7 +309,8 @@ def traffic_stats(chat_id: int, user: sqlite3.Row) -> None:
             """,
             (user["traffic_id"],),
         ).fetchall()
-    lines = [f"Лидов по traffic_id <b>{user['traffic_id']}</b>: {total}"]
+    cpl = round(budget / total, 2) if total else 0
+    lines = [f"Лидов по traffic_id <b>{user['traffic_id']}</b>: {total}", f"Лидов засчитано: {approved}", f"Бюджет: {budget}", f"CPL: {cpl}"]
     lines += [f"{row['full_name']}: {row['count']}" for row in rows]
     send_message(chat_id, "\n".join(lines))
 
@@ -275,11 +318,13 @@ def traffic_stats(chat_id: int, user: sqlite3.Row) -> None:
 def handler_stats(chat_id: int, user: sqlite3.Row) -> None:
     with db() as con:
         total = con.execute("SELECT COUNT(*) AS c FROM leads WHERE handler_user_id = ?", (user["id"],)).fetchone()["c"]
+        paid = con.execute("SELECT COUNT(*) AS c FROM leads WHERE handler_user_id = ? AND lead_payout > 0", (user["id"],)).fetchone()["c"]
         rows = con.execute(
             "SELECT traffic_id, COUNT(*) AS count FROM leads WHERE handler_user_id = ? GROUP BY traffic_id ORDER BY count DESC",
             (user["id"],),
         ).fetchall()
-    lines = [f"Всего внесено лидов: {total}"]
+    conversion = round((paid / total) * 100, 2) if total else 0
+    lines = [f"Всего внесено лидов: {total}", f"Лидов засчитано: {paid}", f"Конверсия: {conversion}%"]
     lines += [f"{row['traffic_id']}: {row['count']}" for row in rows]
     send_message(chat_id, "\n".join(lines))
 
@@ -321,12 +366,25 @@ def continue_add_lead(chat_id: int, user: sqlite3.Row, text: str, state: dict[st
         send_message(chat_id, "Введите traffic_id. Это обязательное поле.")
     elif step == "traffic_id":
         data["traffic_id"] = text.strip()
-        state["step"] = "traffic_type"
-        keyboard = [[button(item, f"leadtype:{item}")] for item in TRAFFIC_TYPES]
-        send_message(chat_id, "Выберите traffic_type.", keyboard)
+        state["step"] = "offer"
+        keyboard = [[button(f"{offer['title']} — {offer['payout']}", f"offer:{key}")] for key, offer in OFFERS.items()]
+        send_message(chat_id, "Выберите оффер, на который прогрели лида.", keyboard)
     elif step == "comment":
         data["comment"] = "" if text.strip() == "-" else text.strip()
         save_lead(chat_id, user, data)
+
+
+def set_offer(chat_id: int, offer_key: str) -> None:
+    state = user_states.get(chat_id)
+    if not state or state.get("action") != "add_lead" or offer_key not in OFFERS:
+        return
+    offer = OFFERS[offer_key]
+    state["data"]["offer_key"] = offer_key
+    state["data"]["offer_title"] = offer["title"]
+    state["data"]["offer_payout"] = float(offer["payout"])
+    state["step"] = "traffic_type"
+    keyboard = [[button(item, f"leadtype:{item}")] for item in TRAFFIC_TYPES]
+    send_message(chat_id, "Выберите источник traffic_type.", keyboard)
 
 
 def set_lead_type(chat_id: int, traffic_type: str) -> None:
@@ -342,10 +400,10 @@ def save_lead(chat_id: int, user: sqlite3.Row, data: dict[str, str]) -> None:
     with db() as con:
         cursor = con.execute(
             """
-            INSERT INTO leads(name, contact, traffic_id, traffic_type, comment, handler_user_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO leads(name, contact, traffic_id, traffic_type, comment, offer_key, offer_title, offer_payout, handler_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (data["name"], data["contact"], data["traffic_id"], data["traffic_type"], data.get("comment"), user["id"]),
+            (data["name"], data["contact"], data["traffic_id"], data["traffic_type"], data.get("comment"), data["offer_key"], data["offer_title"], data["offer_payout"], user["id"]),
         )
     user_states.pop(chat_id, None)
     audit(user["telegram_id"], "LEAD_CREATED", {"lead_id": cursor.lastrowid, "traffic_id": data["traffic_id"]})
@@ -362,7 +420,7 @@ def show_handler_leads(chat_id: int, user: sqlite3.Row) -> None:
         keyboard = [[button(status, f"leadstatus:{lead['id']}:{status}")] for status in LEAD_STATUSES if status != lead["status"]]
         send_message(
             chat_id,
-            f"Лид #{lead['id']}\n{lead['name']}\n{lead['contact']}\ntraffic_id: {lead['traffic_id']}\ntype: {lead['traffic_type']}\nstatus: {lead['status']}",
+            f"Лид #{lead['id']}\n{lead['name']}\n{lead['contact']}\ntraffic_id: {lead['traffic_id']}\ntype: {lead['traffic_type']}\nоффер: {lead['offer_title'] or '-'}\nstatus: {lead['status']}",
             keyboard,
         )
 
@@ -378,6 +436,37 @@ def change_lead_status(chat_id: int, user: sqlite3.Row, lead_id: int, status: st
     send_message(chat_id, f"Статус лида #{lead_id} изменён на {status}.")
 
 
+
+def start_add_budget(chat_id: int) -> None:
+    user_states[chat_id] = {"action": "add_budget"}
+    send_message(chat_id, "Введите сумму бюджета числом. Например: 1500")
+
+
+def save_budget(chat_id: int, user: sqlite3.Row, text: str) -> None:
+    try:
+        amount = float(text.replace(",", ".").strip())
+    except ValueError:
+        send_message(chat_id, "Не понял сумму. Введите число, например 1500")
+        return
+    with db() as con:
+        con.execute("INSERT INTO traffic_budgets(traffic_user_id, amount) VALUES (?, ?)", (user["id"], amount))
+    user_states.pop(chat_id, None)
+    audit(user["telegram_id"], "TRAFFIC_BUDGET_ADDED", {"amount": amount})
+    send_message(chat_id, f"Бюджет сохранён: {amount}")
+
+
+def show_payout_requests(chat_id: int, user: sqlite3.Row) -> None:
+    with db() as con:
+        leads = con.execute(
+            "SELECT * FROM leads WHERE handler_user_id = ? AND status = 'заявка на выплату' ORDER BY created_at DESC",
+            (user["id"],),
+        ).fetchall()
+    if not leads:
+        send_message(chat_id, "Активных заявок на выплату нет.")
+        return
+    for lead in leads:
+        send_message(chat_id, f"Заявка на выплату лида #{lead['id']}\n{lead['name']}\nОффер: {lead['offer_title']}\nВыплата с оффера: {lead['offer_payout']}")
+
 def handle_text(message: dict[str, Any]) -> None:
     chat_id = int(message["chat"]["id"])
     text = message.get("text", "")
@@ -389,6 +478,9 @@ def handle_text(message: dict[str, Any]) -> None:
     state = user_states.get(chat_id)
     if state and state.get("action") == "set_traffic_id":
         set_traffic_id(chat_id, int(message["from"]["id"]), text, state)
+        return
+    if state and state.get("action") == "add_budget" and user and user["role"] == "traffic":
+        save_budget(chat_id, user, text)
         return
     if state and state.get("action") == "add_lead" and user and user["role"] == "handler":
         continue_add_lead(chat_id, user, text, state)
@@ -426,6 +518,8 @@ def handle_callback(callback: dict[str, Any]) -> None:
         show_active_handlers(chat_id)
     elif data.startswith("traffic:select:") and user["role"] == "traffic":
         select_handler(chat_id, user, int(data.split(":")[2]))
+    elif data == "traffic:add_budget" and user["role"] == "traffic":
+        start_add_budget(chat_id)
     elif data == "traffic:stats" and user["role"] == "traffic":
         traffic_stats(chat_id, user)
     elif data == "handler:shift_on" and user["role"] == "handler":
@@ -436,8 +530,12 @@ def handle_callback(callback: dict[str, Any]) -> None:
         start_add_lead(chat_id)
     elif data == "handler:leads" and user["role"] == "handler":
         show_handler_leads(chat_id, user)
+    elif data == "handler:payout_requests" and user["role"] == "handler":
+        show_payout_requests(chat_id, user)
     elif data == "handler:stats" and user["role"] == "handler":
         handler_stats(chat_id, user)
+    elif data.startswith("offer:") and user["role"] == "handler":
+        set_offer(chat_id, data.split(":", 1)[1])
     elif data.startswith("leadtype:") and user["role"] == "handler":
         set_lead_type(chat_id, data.split(":", 1)[1])
     elif data.startswith("leadstatus:") and user["role"] in {"handler", "admin"}:
@@ -447,18 +545,103 @@ def handle_callback(callback: dict[str, Any]) -> None:
         send_message(chat_id, "Команда недоступна для вашей роли.")
 
 
+
+def html_escape(value: Any) -> str:
+    return str(value if value is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def lead_rows_for_user(user: sqlite3.Row) -> list[sqlite3.Row]:
+    with db() as con:
+        if user["role"] == "admin":
+            return con.execute("SELECT leads.*, users.full_name AS handler_name FROM leads JOIN users ON users.id = leads.handler_user_id ORDER BY leads.created_at DESC").fetchall()
+        if user["role"] == "traffic":
+            return con.execute("SELECT leads.*, users.full_name AS handler_name FROM leads JOIN users ON users.id = leads.handler_user_id WHERE leads.traffic_id = ? ORDER BY leads.created_at DESC", (user["traffic_id"],)).fetchall()
+        return con.execute("SELECT leads.*, users.full_name AS handler_name FROM leads JOIN users ON users.id = leads.handler_user_id WHERE leads.handler_user_id = ? ORDER BY leads.created_at DESC", (user["id"],)).fetchall()
+
+
+def render_dashboard(telegram_id: int) -> str:
+    user = get_user(telegram_id)
+    if not user or user["status"] != "approved":
+        return "<h1>CRM</h1><p>Нет доступа. Откройте бота и пройдите регистрацию.</p>"
+    leads = lead_rows_for_user(user)
+    budget = 0
+    if user["role"] == "traffic":
+        with db() as con:
+            budget = con.execute("SELECT COALESCE(SUM(amount), 0) AS s FROM traffic_budgets WHERE traffic_user_id = ?", (user["id"],)).fetchone()["s"]
+    paid_count = sum(1 for lead in leads if lead["lead_payout"] > 0)
+    cpl = round(budget / len(leads), 2) if user["role"] == "traffic" and leads else 0
+    conversion = round((paid_count / len(leads)) * 100, 2) if user["role"] == "handler" and leads else 0
+    rows = []
+    for lead in leads:
+        net = float(lead["offer_payout"] or 0) - float(lead["lead_payout"] or 0)
+        admin_cells = ""
+        if user["role"] == "admin":
+            admin_cells = f"<td>{lead['offer_payout']}</td><td>{lead['lead_payout']}</td><td>{net}</td><td><form action='/pay'><input type='hidden' name='tg' value='{telegram_id}'><input type='hidden' name='lead' value='{lead['id']}'><input name='amount' placeholder='выплата лиду'><button>OK</button></form></td>"
+        rows.append(f"<tr><td>{lead['id']}</td><td>{html_escape(lead['name'])}</td><td>{html_escape(lead['traffic_id'])}</td><td>{html_escape(lead['handler_name'])}</td><td>{html_escape(lead['status'])}</td><td>{html_escape(lead['offer_title'])}</td>{admin_cells}</tr>")
+    admin_headers = "<th>Выплата с оффера</th><th>Выплата лиду</th><th>Чистыми</th><th>Оплатить</th>" if user["role"] == "admin" else ""
+    stats = ""
+    if user["role"] == "traffic":
+        stats = f"<p>Бюджет: <b>{budget}</b> · CPL: <b>{cpl}</b> · Лидов засчитано: <b>{paid_count}</b></p>"
+    if user["role"] == "handler":
+        stats = f"<p>Конверсия: <b>{conversion}%</b> · Лидов засчитано: <b>{paid_count}</b></p>"
+    return f"""
+    <!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>body{{font-family:Arial;background:#101827;color:#eef2ff;padding:16px}}table{{width:100%;border-collapse:collapse;background:#172033}}td,th{{border:1px solid #334155;padding:8px}}input,button{{padding:8px;border-radius:8px;border:0}}button{{background:#22c55e}}</style></head>
+    <body><h1>CRM Dashboard</h1><p>{html_escape(user['full_name'])} · {user['role']}</p>{stats}
+    <h2>Меню лидов</h2><table><tr><th>ID</th><th>Юз</th><th>Траффер</th><th>Обработчик</th><th>Статус</th><th>Оффер</th>{admin_headers}</tr>{''.join(rows)}</table></body></html>
+    """
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        telegram_id = int(params.get("tg", [ADMIN_IDS[0]])[0])
+        if parsed.path == "/pay":
+            lead_id = int(params.get("lead", [0])[0])
+            amount = float(params.get("amount", [0])[0] or 0)
+            user = get_user(telegram_id)
+            if user and user["role"] == "admin" and lead_id and amount >= 0:
+                with db() as con:
+                    con.execute("UPDATE leads SET lead_payout = ?, status = 'выплачено', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (amount, lead_id))
+                audit(telegram_id, "LEAD_PAID", {"lead_id": lead_id, "amount": amount})
+            self.send_response(302)
+            self.send_header("Location", f"/?tg={telegram_id}")
+            self.end_headers()
+            return
+        body = render_dashboard(telegram_id).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_web_server() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), DashboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Dashboard is running: http://localhost:{WEB_PORT}")
+
 def poll() -> None:
     offset = 0
     print("Bot is running. Press Ctrl+C to stop.")
     while True:
         try:
-            response = api("getUpdates", {"offset": offset, "timeout": 50})
+            response = api("getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": json.dumps(["message", "callback_query"])})
             for update in response.get("result", []):
+                # Offset is advanced before processing so a handler error cannot resend the same update 2-3 times.
                 offset = update["update_id"] + 1
-                if "message" in update:
-                    handle_text(update["message"])
-                elif "callback_query" in update:
-                    handle_callback(update["callback_query"])
+                try:
+                    if "message" in update:
+                        handle_text(update["message"])
+                    elif "callback_query" in update:
+                        handle_callback(update["callback_query"])
+                except Exception:
+                    traceback.print_exc()
         except KeyboardInterrupt:
             print("Stopped")
             break
@@ -471,4 +654,5 @@ if __name__ == "__main__":
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_TELEGRAM_BOT_TOKEN_HERE":
         raise RuntimeError("Open config.py and put your Telegram bot token into BOT_TOKEN")
     init_db()
+    start_web_server()
     poll()
