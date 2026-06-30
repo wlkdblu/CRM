@@ -1,0 +1,2 @@
+# Dependencies are intentionally empty.
+# The MVP uses only Python standard library: sqlite3, urllib, json, time.
